@@ -1,161 +1,172 @@
-let s:script = denops#util#script_path('@denops-private', 'cli.ts')
-let s:engine = has('nvim') ? 'nvim' : 'vim'
-let s:vim_exiting = 0
-let s:stopped_on_purpose = 0
-let s:job = v:null
-let s:chan = v:null
-let s:STATUS_STOPPED = 'stopped'
-let s:STATUS_STARTING = 'starting'
-let s:STATUS_RUNNING = 'running'
+vim9script
 
-function! denops#server#start() abort
+const script = denops#util#script_path('@denops-private', 'cli.ts')
+const engine = has('nvim') ? 'nvim' : 'vim'
+var vim_exiting = false
+var stopped_on_purpose = false
+var job: job
+var chan: channel
+var NO_JOB: job
+lockvar NO_JOB
+var NO_CHANNEL: channel
+lockvar NO_CHANNEL
+const STATUS_STOPPED = 'stopped'
+const STATUS_STARTING = 'starting'
+const STATUS_RUNNING = 'running'
+
+def denops#server#start()
   if g:denops#disabled
     return
-  elseif denops#server#status() isnot# s:STATUS_STOPPED
-    call denops#util#debug('Server is already starting or running. Skip')
+  elseif denops#server#status() != STATUS_STOPPED
+    denops#util#debug('Server is already starting or running. Skip')
     return
   endif
-  let args = [g:denops#server#deno, 'run']
-  let args += g:denops#server#deno_args
-  let args += [
-        \ s:script,
-        \ '--mode=' . s:engine,
-        \]
+  var args: list<string> = [g:denops#server#deno, 'run']
+  args += g:denops#server#deno_args
+  args += [
+    script,
+    '--mode=' .. engine,
+  ]
   if g:denops#trace
-    let args += ['--trace']
+    args += ['--trace']
   endif
-  let raw_options = has('nvim')
-        \ ? {}
-        \ : { 'mode': 'nl' }
-  let s:stopped_on_purpose = 0
-  let s:chan = v:null
-  let s:job = denops#job#start(args, {
-        \ 'env': {
-        \   'NO_COLOR': 1,
-        \ },
-        \ 'on_stdout': funcref('s:on_stdout'),
-        \ 'on_stderr': funcref('s:on_stderr'),
-        \ 'on_exit': funcref('s:on_exit'),
-        \ 'raw_options': raw_options,
-        \})
-  call denops#util#debug(printf('Server spawned: %s', args))
+  const raw_options = has('nvim')
+    ? {}
+    : { mode: 'nl' }
+  stopped_on_purpose = false
+  chan = NO_CHANNEL
+  job = denops#job#start(args, {
+    env: {
+      NO_COLOR: 1,
+    },
+    on_stdout: OnStdout,
+    on_stderr: OnStderr,
+    on_exit: OnExit,
+    raw_options: raw_options,
+  })
+  denops#util#debug(printf('Server spawned: %s', args))
   doautocmd <nomodeline> User DenopsStarted
-endfunction
+enddef
 
-function! denops#server#stop() abort
-  if s:job isnot# v:null
-    let s:stopped_on_purpose = 1
-    call denops#job#stop(s:job)
+def denops#server#stop()
+  if !!job
+    stopped_on_purpose = true
+    denops#job#stop(job)
   endif
-endfunction
+enddef
 
-function! denops#server#restart() abort
-  call denops#server#stop()
-  call denops#server#start()
-endfunction
+def denops#server#restart()
+  denops#server#stop()
+  denops#server#start()
+enddef
 
-function! denops#server#status() abort
-  if s:job isnot# v:null && s:chan isnot# v:null
-    return s:STATUS_RUNNING
-  elseif s:job isnot# v:null
-    return s:STATUS_STARTING
+def denops#server#status(): string
+  if !!job && !!chan
+    return STATUS_RUNNING
+  elseif !!job
+    return STATUS_STARTING
   else
-    return s:STATUS_STOPPED
+    return STATUS_STOPPED
   endif
-endfunction
+enddef
 
-function! denops#server#notify(method, params) abort
+def denops#server#notify(method: string, params: list<any>)
   if g:denops#disabled
     return
-  elseif denops#server#status() isnot# s:STATUS_RUNNING
+  elseif denops#server#status() != STATUS_RUNNING
     throw printf('The server is not ready yet')
   endif
-  return s:notify(s:chan, a:method, a:params)
-endfunction
+  Notify(chan, method, params)
+enddef
 
-function! denops#server#request(method, params) abort
+def denops#server#request(method: string, params: list<any>): any
   if g:denops#disabled
-    return
-  elseif denops#server#status() isnot# s:STATUS_RUNNING
+    return v:null
+  elseif denops#server#status() != STATUS_RUNNING
     throw printf('The server is not ready yet')
   endif
-  return s:request(s:chan, a:method, a:params)
-endfunction
+  return Request(chan, method, params)
+enddef
 
-function! s:on_stdout(data) abort
-  if s:chan isnot# v:null
-    for line in split(a:data, '\n')
+def OnStdout(data: string)
+  if !!chan
+    for line in split(data, '\n')
       echomsg printf('[denops] %s', substitute(line, '\t', '    ', 'g'))
     endfor
     return
   endif
-  let addr = substitute(a:data, '\r\?\n$', '', 'g')
-  call denops#util#debug(printf('Connecting to `%s`', addr))
+  const addr = substitute(data, '\r\?\n$', '', 'g')
+  denops#util#debug(printf('Connecting to `%s`', addr))
   try
-    let s:chan = s:connect(addr)
+    chan = Connect(addr)
   catch
-    call denops#util#error(printf('Failed to connect denops server: %s', v:exception))
-    call denops#server#stop()
-    call s:on_stderr(a:data)
+    denops#util#error(printf('Failed to connect denops server: %s', v:exception))
+    denops#server#stop()
+    OnStderr(data)
     return
   endtry
   doautocmd <nomodeline> User DenopsReady
-endfunction
+enddef
 
-function! s:on_stderr(data) abort
+def OnStderr(data: string)
   echohl ErrorMsg
-  for line in split(a:data, '\n')
+  for line in split(data, '\n')
     echomsg printf('[denops] %s', substitute(line, '\t', '    ', 'g'))
   endfor
   echohl None
-endfunction
+enddef
 
-function! s:on_exit(status, ...) abort dict
-  let s:job = v:null
-  let s:chan = v:null
-  call denops#util#debug(printf('Server stopped: %s', a:status))
+def OnExit(status: number)
+  job = NO_JOB
+  chan = NO_CHANNEL
+  denops#util#debug(printf('Server stopped: %s', status))
   doautocmd <nomodeline> User DenopsStopped
-  if s:stopped_on_purpose || v:dying || v:exiting || s:vim_exiting
+  if stopped_on_purpose || v:dying || !!v:exiting || vim_exiting
     return
   endif
-  " Restart asynchronously to avoid #136
-  call timer_start(g:denops#server#restart_delay, { -> s:restart(a:status) })
-endfunction
+  # Restart asynchronously to avoid #136
+  timer_start(g:denops#server#restart_delay, () => Restart(status))
+enddef
 
-function! s:restart(status) abort
-  if s:restart_guard()
+def Restart(status: number)
+  if RestartGuard()
     return
   endif
-  call denops#util#warn(printf(
-        \ 'Server stopped (%d). Restarting...',
-        \ a:status,
-        \))
-  call denops#server#start()
-  call denops#util#info('Server is restarted.')
-endfunction
+  denops#util#warn(printf(
+    'Server stopped (%d). Restarting...',
+    status,
+  ))
+  denops#server#start()
+  denops#util#info('Server is restarted.')
+enddef
 
-function! s:restart_guard() abort
-  let s:restart_count = get(s:, 'restart_count', 0) + 1
-  if s:restart_count >= g:denops#server#restart_threshold
-    call denops#util#warn(printf(
-          \ 'Server stopped %d times within %d millisec. Denops become disabled to avoid infinity restart loop.',
-          \ g:denops#server#restart_threshold,
-          \ g:denops#server#restart_interval,
-          \))
-    let g:denops#disabled = 1
+var restart_count = 0
+var reset_restart_count_delayer = 0
+def RestartGuard(): number
+  ++restart_count
+  if restart_count >= g:denops#server#restart_threshold
+    denops#util#warn(printf(
+      'Server stopped %d times within %d millisec. Denops become disabled to avoid infinity restart loop.',
+      g:denops#server#restart_threshold,
+      g:denops#server#restart_interval,
+    ))
+    g:denops#disabled = 1
     return 1
   endif
-  if exists('s:reset_restart_count_delayer')
-    call timer_stop(s:reset_restart_count_delayer)
+  if !!reset_restart_count_delayer
+    timer_stop(reset_restart_count_delayer)
   endif
-  let s:reset_restart_count_delayer = timer_start(
-        \ g:denops#server#restart_interval,
-        \ { -> extend(s:, { 'restart_count': 0 }) },
-        \)
-endfunction
+  reset_restart_count_delayer = timer_start(
+    g:denops#server#restart_interval,
+    () => {
+      restart_count = 0
+    },
+  )
+  return 0
+enddef
 
 if has('nvim')
-  function! s:connect(address) abort
+  function s:connect(address) abort
     let chan = sockconnect('tcp', a:address, {
           \ 'rpc': v:true,
           \})
@@ -165,38 +176,38 @@ if has('nvim')
     return chan
   endfunction
 
-  function! s:notify(chan, method, params) abort
+  function s:notify(chan, method, params) abort
     return call('rpcnotify', [a:chan, a:method] + a:params)
   endfunction
 
-  function! s:request(chan, method, params) abort
+  function s:request(chan, method, params) abort
     return call('rpcrequest', [a:chan, a:method] + a:params)
   endfunction
 else
-  function! s:connect(address) abort
-    let chan = ch_open(a:address, {
-          \ 'mode': 'json',
-          \ 'drop': 'auto',
-          \ 'noblock': 1,
-          \ 'timeout': 60 * 60 * 24 * 7,
-          \})
-    if ch_status(chan) !=# 'open'
-      throw printf('Failed to connect `%s`', a:address)
+  def Connect(address: string): channel
+    const ch = ch_open(address, {
+        mode: 'json',
+        drop: 'auto',
+        noblock: 1,
+        timeout: 60 * 60 * 24 * 7,
+      })
+    if ch_status(ch) !=# 'open'
+      throw printf('Failed to connect `%s`', address)
     endif
-    return chan
-  endfunction
+    return ch
+  enddef
 
-  function! s:notify(chan, method, params) abort
-    return ch_sendraw(a:chan, json_encode([0, [a:method] + a:params]) . "\n")
-  endfunction
+  def Notify(ch: channel, method: string, params: list<any>)
+    ch_sendraw(ch, json_encode([0, [method] + params]) .. "\n")
+  enddef
 
-  function! s:request(chan, method, params) abort
-    let [ok, err] = ch_evalexpr(a:chan, [a:method] + a:params)
-    if err isnot# v:null
+  def Request(ch: channel, method: string, params: list<any>): any
+    final [ok, err] = ch_evalexpr(ch, [method] + params)
+    if type(err) != v:t_none || err != v:null
       throw err
     endif
     return ok
-  endfunction
+  enddef
 endif
 
 augroup denops_server_internal
@@ -204,16 +215,16 @@ augroup denops_server_internal
   autocmd User DenopsStarted :
   autocmd User DenopsStopped :
   autocmd User DenopsReady :
-  autocmd VimLeave * let s:vim_exiting = 1
+  autocmd VimLeave * vim_exiting = true
 augroup END
 
-let g:denops#server#deno = get(g:, 'denops#server#deno', g:denops#deno)
-let g:denops#server#deno_args = get(g:, 'denops#server#deno_args', filter([
-      \ '-q',
-      \ g:denops#type_check ? '' : '--no-check',
-      \ '--unstable',
-      \ '-A',
-      \], { _, v -> !empty(v) }))
-let g:denops#server#restart_delay = get(g:, 'denops#server#restart_delay', 100)
-let g:denops#server#restart_interval = get(g:, 'denops#server#restart_interval', 10000)
-let g:denops#server#restart_threshold = get(g:, 'denops#server#restart_threshold', 3)
+g:denops#server#deno = get(g:, 'denops#server#deno', g:denops#deno)
+g:denops#server#deno_args = get(g:, 'denops#server#deno_args', filter([
+  '-q',
+  g:denops#type_check ? '' : '--no-check',
+  '--unstable',
+  '-A',
+], (_, v) => !empty(v)))
+g:denops#server#restart_delay = get(g:, 'denops#server#restart_delay', 100)
+g:denops#server#restart_interval = get(g:, 'denops#server#restart_interval', 10000)
+g:denops#server#restart_threshold = get(g:, 'denops#server#restart_threshold', 3)
